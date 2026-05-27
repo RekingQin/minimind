@@ -1,3 +1,34 @@
+"""
+MiniMind LoRA（Low-Rank Adaptation）微调训练脚本
+================================================
+功能：在已有的 full_sft 权重基础上，使用 LoRA 进行参数高效微调。
+
+LoRA 核心思想：
+  冻结原始模型的全部权重 W，在目标层（方阵 Linear，即 Q/K/V/O 等 attention 投影层）
+  旁边插入一对低秩矩阵 A（d×r）和 B（r×d），前向时输出变为：
+      y = W·x + B(A(x))
+  只训练 A、B（参数量远小于 W），即可达到接近全参数微调的效果。
+
+Forward 流程：
+  apply_lora(model) 通过 monkey-patch 替换目标 Linear 层的 forward 方法，
+  使得每次 forward 自动计算 original_output + lora_output，对模型其它代码完全透明。
+
+Backward 流程：
+  原始权重 W 的 requires_grad=False（冻结），backward 时不计算也不存储其梯度；
+  只有 LoRA 的 A.weight、B.weight 有梯度 → 显存开销和计算量都大幅降低。
+
+与 Full SFT 的对比：
+  - Full SFT：全部参数可训练，optimizer 管全部参数
+  - LoRA：只有 ~0.5-2% 的 LoRA 参数可训练，optimizer 只管 lora_params
+
+核心特性：
+  - 支持单卡 / DDP 多卡分布式训练
+  - 支持混合精度训练（bf16 / fp16）
+  - 支持梯度累积、梯度裁剪（仅裁剪 LoRA 参数）
+  - 保存时只存 LoRA 权重（几 MB vs 全模型几百 MB）
+  - 支持断点续训
+  - 不兼容 torch.compile（monkey-patch forward 与 compile 冲突，会自动关闭）
+"""
 import os
 import sys
 
@@ -34,15 +65,30 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             param_group['lr'] = lr
 
         with autocast_ctx:
+            # ===== LoRA Forward 机制 =====
+            # model(input_ids) 内部递归调用各层 forward：
+            #   对于被 apply_lora 注入的 Linear 层（Q/K/V/O 等方阵投影），
+            #   forward 已被 monkey-patch 替换为：
+            #       output = W·x + B(A(x))
+            #                ↑原始权重(frozen)  ↑LoRA旁路(trainable, rank=16)
+            #   其余层（Embedding, MLP gate/up/down, LM Head）不受影响，正常前向。
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
+        # ===== LoRA Backward 机制 =====
+        # 由于原始权重 W 的 requires_grad=False，autograd 不会为 W 计算/存储梯度。
+        # 梯度只会流向 LoRA 的 A.weight 和 B.weight，计算量和显存开销极小。
+        # 注：梯度仍然需要"经过" W 的前向输出做链式法则（因为 loss 依赖 W·x），
+        #     但不会为 W 本身分配梯度张量。
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+            # 注意：只裁剪 LoRA 参数的梯度（而非全模型参数），
+            # 因为只有 lora_params 有梯度，其它参数 grad=None
             torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
+            # optimizer 也只管 lora_params（初始化时: AdamW(lora_params, ...)）
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -61,7 +107,8 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             lora_save_path = f'{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}{moe_suffix}.pth'
-            # LoRA只保存LoRA权重
+            # LoRA 只保存 LoRA 权重（A/B 矩阵），文件极小（几 MB）
+            # save_lora 会遍历所有带 .lora 属性的模块，提取其 state_dict 保存
             save_lora(model, lora_save_path)
             lm_checkpoint(lm_config, weight=args.lora_name, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
@@ -126,7 +173,15 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
+    # 先加载完整的 full_sft 预训练权重
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    # apply_lora(model) 做了以下事情（见 model/model_lora.py）：
+    #   1. 遍历所有 nn.Linear 层，筛选出"方阵"（in_features == out_features）的层
+    #      → 这些通常是 Attention 中的 Q/K/V/O 投影
+    #   2. 为每个目标层创建 LoRA(A, B) 子模块并挂到该 Linear 上
+    #   3. monkey-patch 该层的 forward 为：output = original(x) + B(A(x))
+    #      → 从此每次 forward 自动叠加 LoRA 旁路输出
+    # B 矩阵初始化为全零 → 初始时 LoRA 输出为 0，模型行为与未加 LoRA 完全一致
     apply_lora(model)
     
     # 统计参数
@@ -137,6 +192,10 @@ if __name__ == "__main__":
     Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
     
     # 冻结非LoRA参数，收集LoRA参数
+    # 这一步决定了 backward 时哪些参数会计算梯度：
+    #   requires_grad=True  → autograd 会为其分配梯度张量，参与优化
+    #   requires_grad=False → 不分配梯度张量，显存大幅节省
+    # 效果：backward 时只有 LoRA 的 A/B 矩阵产生梯度（占总参数 ~0.5-2%）
     lora_params = []
     for name, param in model.named_parameters():
         if 'lora' in name:
@@ -149,6 +208,8 @@ if __name__ == "__main__":
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    # 注意：optimizer 只接收 lora_params，不管原始模型参数
+    # → AdamW 内部只为 LoRA 参数维护动量（m, v），显存占用极小
     optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
     
     # ========== 7. 从ckp恢复状态 ==========
@@ -161,6 +222,9 @@ if __name__ == "__main__":
         start_step = ckp_data.get('step', 0)
     
     # ========== 8. 编译和分布式包装 ==========
+    # LoRA 通过 monkey-patch 替换 Linear.forward，这与 torch.compile 的图捕获机制冲突：
+    # compile 会尝试把 forward 编译成静态图，但 monkey-patch 的闭包无法被正确 trace。
+    # 因此这里自动关闭 compile。
     if args.use_compile == 1:
         args.use_compile = 0
         Logger('[LoRA] monkey-patch forward 与 torch.compile 不兼容，use_compile 已自动关闭')
