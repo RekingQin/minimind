@@ -122,12 +122,45 @@ class Attention(nn.Module):
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
+        # ==================== 注意力计算：Flash Attention vs 手动实现 ====================
+        # 进入条件（同时满足以下全部才用 Flash Attention）：
+        #   1. self.flash=True: 环境支持 scaled_dot_product_attention 且配置开启
+        #   2. seq_len > 1: 非单 token 生成步（单 token 时 Flash 无优势）
+        #   3. not self.is_causal or past_key_value is None:
+        #      - 非因果模型，或
+        #      - 是因果模型但无 KV Cache（即首次 prefill 阶段）
+        #      原因：有 KV Cache 时 Q 只有最新 token 而 K 有全部历史，
+        #            PyTorch 的 is_causal=True 只对方阵生效，非方阵会出错
+        #   4. attention_mask 全为 1 或为 None: Flash Attention 不支持自定义 mask
         if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            # Flash Attention: O(N) 内存，不显式构造 attention matrix
+            # is_causal=True 时内部自动应用因果三角 mask
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
+            # ---- 手动注意力实现（用于生成阶段 / 自定义 mask 场景）----
+
+            # 1. 计算注意力分数: Q·Kᵀ / √d_k
+            #    xq: [batch, heads, seq_len, head_dim]
+            #    xk: [batch, heads, kv_len, head_dim] (kv_len = past_len + seq_len)
+            #    scores: [batch, heads, seq_len, kv_len]
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            # 2. 因果 mask：只对 scores 的最后 seq_len 列应用上三角 -∞
+            #    为什么是 [:, :, :, -seq_len:]？
+            #    当有 KV Cache 时 kv_len > seq_len，前面的列对应历史 token（当前 Q 都能看到）
+            #    只有最后 seq_len 列对应当前新增的 token，需要三角 mask 防止看到未来
+            #    triu(1): 对角线以上填 -∞ → softmax 后变为 0（屏蔽未来信息）
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+
+            # 3. padding mask：将 attention_mask=0 的位置加一个极大负值
+            #    attention_mask shape: [batch, kv_len] → unsqueeze → [batch, 1, 1, kv_len]
+            #    广播到 scores 的所有 head 和 query 位置
+            #    (1.0 - 0) * -1e9 = -1e9 → softmax 后约等于 0（忽略 padding token）
             if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+
+            # 4. softmax 归一化 + dropout + 加权求和 V
+            #    .float() 保证 softmax 在 fp32 下计算（数值稳定）
+            #    .type_as(xq) 转回原精度（如 bf16）再乘 V
             output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
@@ -169,7 +202,74 @@ class MOEFeedForward(nn.Module):
             elif self.training:
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.config.router_aux_loss_coef > 0:
+            # ==================== Auxiliary Load Balancing Loss ====================
+            # 来源: Switch Transformers (Google, 2021) — 负载均衡辅助损失
+            #
+            # 【问题背景 — 路由坍塌(Routing Collapse)】
+            # MoE 路由器存在正反馈死循环：某专家被选中多 → 梯度更新多 → 变更强
+            # → 路由器给更高分 → 被选中更多 → ... 最终只有少数专家工作，MoE退化为Dense模型
+            #
+            # 【数学公式】
+            #   L_aux = N × Σᵢ(fᵢ × Pᵢ) × coef
+            #   其中:
+            #     N = num_experts (专家数量)
+            #     fᵢ = 专家i的实际负载频率 (被选中的token比例, 离散不可微)
+            #     Pᵢ = 路由器分配给专家i的平均概率 (连续可微, 梯度通过此项回传)
+            #     coef = router_aux_loss_coef (正则权重)
+            #
+            # 【为什么用 fᵢ×Pᵢ 乘积形式？】
+            #   - fᵢ 是 argmax 离散选择的结果，不可直接求导
+            #   - Pᵢ 是 softmax 连续输出，梯度可以流过
+            #   - 乘积形式让梯度只通过 Pᵢ 回传，间接引导 fᵢ 趋于均匀
+            #
+            # 【数学保证 — 最小值在均匀分布处】
+            #   约束 Σfᵢ=1, ΣPᵢ=1 下，由 Cauchy-Schwarz / AM-GM 不等式:
+            #     Σ(fᵢ×Pᵢ) ≥ 1/N
+            #   当且仅当 fᵢ = Pᵢ = 1/N 时取等号（完全均匀 = 全局最优）
+            #
+            # 【乘以 N 的归一化含义】
+            #   - 理想均匀时: N × N × (1/N²) = 1.0
+            #   - 完全坍塌时: N × 1 × 1 = N
+            #   - 使 loss 范围归一化到 [1, N]，与专家数量解耦
+            #
+            # 【coef 权重的权衡】(默认 5e-4)
+            #   - 太大: 强制均匀但牺牲模型质量（不让模型选最合适的专家）
+            #   - 太小: 均衡效果弱，仍会坍塌
+            #   - 经验范围: 1e-4 ~ 1e-2 (Switch Transformer原文用1e-2, Mixtral等用更小值)
+            #
+            # 【演进脉络】
+            #   Shazeer 2017 (MoE Layer) → GShard 2020 → Switch Transformer 2021(本实现)
+            #   → ST-MoE 2022 (加router z-loss) → Mixtral/DeepSeek 2023-24 (沿用+更小coef)
+            #
+            # ======================== 具体数值实例 ========================
+            # 假设 num_experts=4, num_experts_per_tok=1, 共 8 个 token
+            #
+            # topk_idx = [[2], [0], [0], [2], [0], [3], [0], [2]]  (每个token选了哪个专家)
+            #   → one_hot 后 shape=[8, 1, 4]:
+            #     token0: [[0,0,1,0]], token1: [[1,0,0,0]], token2: [[1,0,0,0]], ...
+            #   → mean(dim=0) 得 load, shape=[1, 4]:
+            #     load = [[0.5, 0.0, 0.375, 0.125]]
+            #     含义: 专家0被选中50%, 专家1被选中0%, 专家2被选中37.5%, 专家3被选中12.5%
+            #
+            # scores.mean(0) → shape=[4], 所有token对各专家的平均路由概率（重要性）
+            #   假设 scores.mean(0) = [0.4, 0.1, 0.35, 0.15]
+            #
+            # load * scores.mean(0) = [0.5*0.4, 0.0*0.1, 0.375*0.35, 0.125*0.15]
+            #                        = [0.200,   0.000,   0.131,       0.019]
+            #
+            # .sum() = 0.350
+            # × num_experts(4) = 1.400
+            # × router_aux_loss_coef(5e-4) = 0.0007  ← 最终 aux_loss
+            #
+            # 【对比理想均匀情况】load=[0.25,0.25,0.25,0.25], scores=[0.25,0.25,0.25,0.25]
+            #   → (0.25*0.25)*4 = 0.25, × 4 × 5e-4 = 0.0005 ← 更小（全局最优）
+            #
+            # 结论：最小化此 loss → 路由器学会均匀分配 token 给各专家
+            # ==================================================================
+
+            # load: 各专家实际被选中的频率 fᵢ (负载分布, 离散)
             load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
+            # aux_loss = N × Σ(fᵢ × Pᵢ) × coef
             self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
         else:
             self.aux_loss = scores.new_zeros(1).squeeze()
